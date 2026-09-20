@@ -373,7 +373,7 @@ function setRange(a,b, restart=true){
   a = Math.max(1, Math.min(TOTAL, Math.round(a) || 1));
   b = Math.max(a, Math.min(TOTAL, Math.round(b) || a));
   S.start = a; S.end = b; save(); syncInputs(); render();
-  if (P.active && restart) { P.cur = a; P.rep = 0; P.round = 0; playCurrent(); } else ui();
+  if (P.active && restart) { P.cur = a; startSession(a); } else ui();
 }
 $('#rs').onchange = () => setRange(Number($('#rs').value), Math.max(Number($('#re').value), Number($('#rs').value)));
 $('#re').onchange = () => setRange(Number($('#rs').value), Number($('#re').value));
@@ -397,7 +397,7 @@ $$('.seg[data-key]').forEach(seg => {
   seg.addEventListener('click', e => {
     const b = e.target.closest('button'); if (!b) return;
     const k = seg.dataset.key; S[k] = k === 'gap' ? b.dataset.v : Number(b.dataset.v);
-    save(); paintSeg(seg); if (k === 'speed') audio.playbackRate = S.speed; ui();
+    save(); paintSeg(seg); if (k === 'speed') audio.playbackRate = S.speed; else refreshSession(); ui();
   });
 });
 const hideEl = $('#hide'), hideVal = $('#hideVal');
@@ -411,77 +411,153 @@ const applyFs = () => document.documentElement.style.setProperty('--fs', S.fs);
 $('#fPlus').onclick = () => { S.fs = Math.min(1.8, +(S.fs + .1).toFixed(2)); applyFs(); save(); };
 $('#fMinus').onclick = () => { S.fs = Math.max(.8, +(S.fs - .1).toFixed(2)); applyFs(); save(); };
 
-/* ================= المشغّل ================= */
+/* ================= المشغّل: جلسة صوتية واحدة =================
+   نجمع تلاوات المقطع كلها (مع التكرار والصمت) في ملف صوتي واحد ثم نشغّله.
+   بهذا يكمل الصوت والشاشة مقفلة أو والتطبيق في الخلفية، لأنه لا يعتمد على مؤقّتات الصفحة. */
 const audio = new Audio(); audio.preload = 'auto';
-const P = { active:false, paused:false, inGap:false, cur:1, rep:0, round:0, timer:null, token:0, obj:null, fromCache:false };
+const P = { active:false, building:false, status:'', segs:[], url:null, cur:1, rep:0, round:0, loops:0, lastT:0, inAyah:false, fromCache:false, tok:0 };
+const RAW = new Map();                  // ذاكرة مؤقتة للملفات الخام أثناء الجلسة
+const MAX_BYTES = 40 * 1024 * 1024;     // سقف حجم الملف المدمج
 const ICON_PLAY = 'M8 5v14l11-7z', ICON_PAUSE = 'M6 5h4v14H6zM14 5h4v14h-4z';
-
-async function srcFor(n){
+let ACTX = null;
+function ctx(){
+  if (ACTX) return ACTX;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  try { ACTX = new AC({ sampleRate: 22050 }); } catch(e) { ACTX = new AC(); }
+  return ACTX;
+}
+async function rawFor(n){
   const u = urlFor(S.reciter, n);
-  if (hasCache) {
-    try { const c = await caches.open(CACHE); const r = await c.match(u);
-      if (r) { const b = await r.blob(); return { url:URL.createObjectURL(b), cached:true, obj:true }; } } catch(e) {}
+  if (RAW.has(u)) return RAW.get(u);
+  let ab = null;
+  if (hasCache) { try { const c = await caches.open(CACHE); const r = await c.match(u); if (r) ab = await r.arrayBuffer(); } catch(e) {} }
+  if (ab) P.allCached = P.allCached !== false;
+  else {
+    P.allCached = false;
+    if (!navigator.onLine) throw new Error('offline');
+    const r = await fetch(u); if (!r.ok) throw new Error('http');
+    ab = await r.arrayBuffer();
   }
-  return { url:u, cached:false, obj:false };
+  if (RAW.size > 200) RAW.clear();
+  RAW.set(u, ab); return ab;
 }
-async function playCurrent(){
-  const tok = ++P.token; clearTimeout(P.timer); P.inGap = false;
-  const n = P.cur; markCur(n); setPlayingClass(false);
-  const src = await srcFor(n);
-  if (tok !== P.token) { if (src.obj) URL.revokeObjectURL(src.url); return; }
-  if (!src.cached && !navigator.onLine) { stopAll(); toast('لا يوجد اتصال، وهذه الآية غير محمّلة. حمّلها من تبويب «بدون إنترنت».'); return; }
-  const old = P.obj; audio.src = src.url; P.obj = src.obj ? src.url : null; P.fromCache = src.cached;
+function wavBlob(pcm, sr){
+  const h = new ArrayBuffer(44), v = new DataView(h);
+  const W = (o,t) => { for (let i=0;i<t.length;i++) v.setUint8(o+i, t.charCodeAt(i)); };
+  W(0,'RIFF'); v.setUint32(4, 36 + pcm.byteLength, true); W(8,'WAVE'); W(12,'fmt ');
+  v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
+  v.setUint32(24,sr,true); v.setUint32(28,sr*2,true); v.setUint16(32,2,true); v.setUint16(34,16,true);
+  W(36,'data'); v.setUint32(40, pcm.byteLength, true);
+  return new Blob([h, pcm], { type:'audio/wav' });
+}
+async function buildSession(tok){
+  const ac = ctx(), sr = ac.sampleRate, bufs = new Map();
+  P.allCached = undefined;
+  const count = S.end - S.start + 1;
+  for (let n = S.start; n <= S.end; n++) {
+    if (tok !== P.tok) return null;
+    P.status = `تجهيز التلاوة ${ar(n - S.start + 1)} من ${ar(count)}…`; ui();
+    const ab = await rawFor(n);
+    bufs.set(n, await ac.decodeAudioData(ab.slice(0)));
+  }
+  if (tok !== P.tok) return null;
+  const gapOf = b => S.gap === 'echo' ? b.duration : Number(S.gap);
+  let one = 0; bufs.forEach(b => { one += S.ayahRep * (b.duration + gapOf(b)); });
+  const maxSec = MAX_BYTES / (2 * sr);
+  if (one > maxSec) throw new Error('big');
+  let rounds = S.rangeRep === 0 ? 1 : S.rangeRep, capped = false;
+  if (rounds * one > maxSec) { rounds = Math.max(1, Math.floor(maxSec / one)); capped = true; }
+  const segs = []; let t = 0;
+  for (let r = 0; r < rounds; r++)
+    for (let n = S.start; n <= S.end; n++) {
+      const b = bufs.get(n);
+      for (let k = 0; k < S.ayahRep; k++) { segs.push({ n, rep:k, round:r, start:t, end:t + b.duration }); t += b.duration + gapOf(b); }
+    }
+  const pcm = new Int16Array(Math.ceil(t * sr) + 1);
+  for (const sg of segs) {
+    const b = bufs.get(sg.n), c0 = b.getChannelData(0), c1 = b.numberOfChannels > 1 ? b.getChannelData(1) : null;
+    const off = Math.round(sg.start * sr);
+    for (let i = 0; i < c0.length && off + i < pcm.length; i++) {
+      let x = c1 ? (c0[i] + c1[i]) / 2 : c0[i];
+      x = x > 1 ? 1 : x < -1 ? -1 : x;
+      pcm[off + i] = x < 0 ? x * 32768 : x * 32767;
+    }
+  }
+  return { url: URL.createObjectURL(wavBlob(pcm, sr)), segs, capped, rounds };
+}
+async function startSession(n){
+  const tok = ++P.tok;
+  audio.pause();
+  P.active = true; P.building = true; P.cur = n; P.rep = 0; P.round = 0; P.loops = 0; P.lastT = 0; P.inAyah = false; P.status = '';
+  markCur(n); setPlayingClass(false); ui();
+  let sess;
+  try { sess = await buildSession(tok); }
+  catch(e) {
+    if (tok !== P.tok) return;
+    stopAll();
+    toast(e.message === 'big' ? 'المقطع طويل جداً. قلّل عدد الآيات أو التكرار.'
+        : e.message === 'offline' ? 'لا يوجد اتصال، وبعض الآيات غير محمّلة. حمّلها من تبويب «بدون إنترنت».'
+        : 'تعذّر تجهيز التلاوة. تحقق من الاتصال أو جرّب قارئاً آخر.');
+    return;
+  }
+  if (!sess || tok !== P.tok) { if (sess) URL.revokeObjectURL(sess.url); return; }
+  const old = P.url; P.url = sess.url; P.segs = sess.segs; P.fromCache = !!P.allCached; P.building = false;
+  audio.src = sess.url; audio.loop = S.rangeRep === 0; audio.playbackRate = S.speed;
   if (old) URL.revokeObjectURL(old);
-  audio.playbackRate = S.speed;
-  try { await audio.play(); if (tok === P.token) setPlayingClass(true); }
-  catch(e) { if (tok === P.token && e.name !== 'AbortError') { stopAll(); toast('تعذّر التشغيل. اضغط زر التشغيل مرة أخرى.'); } }
+  const first = sess.segs.find(x => x.round === 0 && x.n === n && x.rep === 0);
+  audio.currentTime = first ? first.start : 0;
+  if (sess.capped) toast(`سيتكرر المقطع ${ar(sess.rounds)} مرات فقط بسبب طوله.`);
   setSession(); ui();
+  try { await audio.play(); }
+  catch(e) { if (tok === P.tok && e.name !== 'AbortError') { stopAll(); toast('تعذّر التشغيل. اضغط زر التشغيل مرة أخرى.'); } }
 }
-function advance(){
-  P.rep++;
-  if (P.rep < S.ayahRep) { playCurrent(); return; }
-  P.rep = 0;
-  if (P.cur < S.end) { P.cur++; playCurrent(); return; }
-  P.round++;
-  if (S.rangeRep === 0 || P.round < S.rangeRep) { P.cur = S.start; playCurrent(); return; }
-  stopAll(); toast('انتهى المقطع');
-}
-audio.addEventListener('ended', () => {
-  if (!P.active || P.paused) return;
-  const tok = P.token; P.inGap = true; setPlayingClass(false);
-  const gap = S.gap === 'echo' ? (audio.duration || 3) * 1000 / S.speed : Number(S.gap) * 1000;
-  P.timer = setTimeout(() => { if (tok === P.token && P.active && !P.paused) advance(); }, gap);
+function refreshSession(){ if (P.active) startSession(P.cur); }
+
+audio.addEventListener('timeupdate', () => {
+  if (!P.active || P.building || !P.segs.length) return;
+  const t = audio.currentTime;
+  if (t < P.lastT - 1) P.loops++;
+  P.lastT = t;
+  $('#dBar').style.width = audio.duration ? (100 * t / audio.duration) + '%' : '0';
+  let cur = null, inAyah = false;
+  for (const sg of P.segs) { if (t < sg.start) break; cur = sg; inAyah = t < sg.end; }
+  if (!cur) return;
+  const changed = cur.n !== P.cur || cur.rep !== P.rep || cur.round + P.loops !== P.round;
+  const nChanged = cur.n !== P.cur;
+  P.cur = cur.n; P.rep = cur.rep; P.round = cur.round + P.loops;
+  if (nChanged) { markCur(P.cur); setSession(); }
+  if (nChanged || inAyah !== P.inAyah) { P.inAyah = inAyah; setPlayingClass(inAyah); }
+  if (changed) ui();
 });
-audio.addEventListener('error', () => {
-  if (!P.active) return;
-  const offline = !navigator.onLine;
-  stopAll();
-  toast(offline ? 'لا يوجد اتصال، وهذه الآية غير محمّلة.' : 'تعذّر تحميل الصوت لهذا القارئ. جرّب قارئاً آخر.');
-});
-audio.addEventListener('timeupdate', () => { $('#dBar').style.width = audio.duration ? (100 * audio.currentTime / audio.duration) + '%' : '0'; });
+audio.addEventListener('ended', () => { if (P.active && !P.building) { stopAll(); toast('انتهى المقطع'); } });
+audio.addEventListener('play', () => ui());
+audio.addEventListener('pause', () => ui());
+audio.addEventListener('error', () => { if (P.active && !P.building) { stopAll(); toast('تعذّر تشغيل الصوت.'); } });
 
 function playFrom(n){
   if (n < S.start || n > S.end) { const len = S.end - S.start + 1; S.start = n; S.end = Math.min(TOTAL, n + len - 1); save(); syncInputs(); render(); }
-  P.active = true; P.paused = false; P.cur = n; P.rep = 0; P.round = 0; playCurrent();
+  startSession(n);
 }
 function togglePlay(){
   if (!P.active) { playFrom(S.start); return; }
-  if (P.paused) { P.paused = false; if (P.inGap) advance(); else audio.play().catch(()=>{}); }
-  else { P.paused = true; clearTimeout(P.timer); audio.pause(); }
-  ui();
+  if (P.building) return;
+  if (audio.paused) audio.play().catch(() => {}); else audio.pause();
 }
 function stopAll(){
-  P.active = false; P.paused = false; P.inGap = false; P.token++; clearTimeout(P.timer);
+  P.tok++; P.active = false; P.building = false; P.segs = []; P.loops = 0; P.inAyah = false;
   audio.pause(); audio.removeAttribute('src');
-  if (P.obj) { URL.revokeObjectURL(P.obj); P.obj = null; }
+  if (P.url) { URL.revokeObjectURL(P.url); P.url = null; }
   $$('.ayah.cur, .ayah.playing', box).forEach(x => x.classList.remove('cur','playing'));
   $('#dBar').style.width = '0'; ui();
 }
 function step(d){
   if (!P.active) { playFrom(S.start); return; }
-  const n = P.cur + d;
-  if (n < S.start || n > S.end) return;
-  P.cur = n; P.rep = 0; P.paused = false; playCurrent();
+  if (P.building || !P.segs.length) return;
+  const cur = P.segs.find(x => x.round === (P.round - P.loops) && x.n === P.cur && x.rep === P.rep) || P.segs[0];
+  let target = null;
+  if (d > 0) target = P.segs.find(x => x.round === cur.round && x.n === cur.n + 1 && x.rep === 0) || P.segs.find(x => x.round === cur.round + 1 && x.n === S.start && x.rep === 0);
+  else target = P.segs.find(x => x.round === cur.round && x.n === cur.n - 1 && x.rep === 0) || P.segs.find(x => x.round === cur.round && x.n === S.start && x.rep === 0);
+  if (target) audio.currentTime = target.start;
 }
 $('#bPlay').onclick = togglePlay;
 $('#bStop').onclick = stopAll;
@@ -489,12 +565,15 @@ $('#bNext').onclick = () => step(1);
 $('#bPrev').onclick = () => step(-1);
 
 function ui(){
-  const playing = P.active && !P.paused;
+  const playing = P.active && !P.building && !audio.paused;
   $('#playPath').setAttribute('d', playing ? ICON_PAUSE : ICON_PLAY);
   $('#bPlay').setAttribute('aria-label', playing ? 'إيقاف مؤقت' : 'تشغيل');
   if (!P.active) {
     $('#dTitle').textContent = `الآيات ${ar(S.start)} – ${ar(S.end)}`;
     $('#dSub').textContent = recName(S.reciter);
+  } else if (P.building) {
+    $('#dTitle').textContent = 'جارٍ التجهيز…';
+    $('#dSub').textContent = P.status || recName(S.reciter);
   } else {
     $('#dTitle').textContent = `الآية ${ar(P.cur)}` + (S.ayahRep > 1 ? ` · المرة ${ar(P.rep+1)}/${ar(S.ayahRep)}` : '');
     const rnd = S.rangeRep === 1 ? '' : ` · الدورة ${ar(P.round+1)}` + (S.rangeRep ? `/${ar(S.rangeRep)}` : '');
@@ -521,7 +600,7 @@ function buildSelect(){
 }
 $('#reciter').onchange = e => {
   S.reciter = e.target.value; save();
-  if (P.active && !P.paused) { P.rep = 0; playCurrent(); } else ui();
+  refreshSession(); ui();
   if ($('#tab-off').classList.contains('on')) renderOffline();
 };
 
