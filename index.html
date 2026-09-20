@@ -420,6 +420,9 @@ const RAW = new Map();                  // ذاكرة مؤقتة للملفات 
 const MAX_BYTES = 40 * 1024 * 1024;     // سقف حجم الملف المدمج
 const ICON_PLAY = 'M8 5v14l11-7z', ICON_PAUSE = 'M6 5h4v14H6zM14 5h4v14h-4z';
 let ACTX = null;
+// جسر اختياري مع تطبيق أندرويد الأصلي (إن وُجد) لإبقاء الصوت حياً في الخلفية
+function nativeState(st){ try { if (window.AndroidBridge) window.AndroidBridge.setState(st); } catch(e) {} }
+function nativeInfo(t, u){ try { if (window.AndroidBridge) window.AndroidBridge.setInfo(t, u); } catch(e) {} }
 function ctx(){
   if (ACTX) return ACTX;
   const AC = window.AudioContext || window.webkitAudioContext;
@@ -530,8 +533,8 @@ audio.addEventListener('timeupdate', () => {
   if (changed) ui();
 });
 audio.addEventListener('ended', () => { if (P.active && !P.building) { stopAll(); toast('انتهى المقطع'); } });
-audio.addEventListener('play', () => ui());
-audio.addEventListener('pause', () => ui());
+audio.addEventListener('play', () => { ui(); if (P.active && !P.building) nativeState('playing'); });
+audio.addEventListener('pause', () => { ui(); if (!P.building) nativeState(P.active ? 'paused' : 'stopped'); });
 audio.addEventListener('error', () => { if (P.active && !P.building) { stopAll(); toast('تعذّر تشغيل الصوت.'); } });
 
 function playFrom(n){
@@ -548,7 +551,7 @@ function stopAll(){
   audio.pause(); audio.removeAttribute('src');
   if (P.url) { URL.revokeObjectURL(P.url); P.url = null; }
   $$('.ayah.cur, .ayah.playing', box).forEach(x => x.classList.remove('cur','playing'));
-  $('#dBar').style.width = '0'; ui();
+  $('#dBar').style.width = '0'; ui(); nativeState('stopped');
 }
 function step(d){
   if (!P.active) { playFrom(S.start); return; }
@@ -578,6 +581,7 @@ function ui(){
     $('#dTitle').textContent = `الآية ${ar(P.cur)}` + (S.ayahRep > 1 ? ` · المرة ${ar(P.rep+1)}/${ar(S.ayahRep)}` : '');
     const rnd = S.rangeRep === 1 ? '' : ` · الدورة ${ar(P.round+1)}` + (S.rangeRep ? `/${ar(S.rangeRep)}` : '');
     $('#dSub').textContent = recName(S.reciter) + rnd + (P.fromCache ? ' · محمّلة' : '');
+    nativeInfo($('#dTitle').textContent, $('#dSub').textContent);
   }
 }
 function setSession(){

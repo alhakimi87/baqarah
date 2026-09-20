@@ -1,6 +1,6 @@
 // Service worker: يحفظ واجهة التطبيق والخطوط لتعمل دون إنترنت.
 // الصوت والنص يديرهما التطبيق نفسه (Cache API + localStorage).
-const SHELL = 'baq-shell-v2';
+const SHELL = 'baq-shell-v3';
 const FONTS = 'baq-fonts-v1';
 const FILES = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png'];
 
